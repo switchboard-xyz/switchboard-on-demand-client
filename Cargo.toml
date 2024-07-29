@@ -10,7 +10,7 @@ anyhow_ext = "0.2.1"
 arrayref = "0.3.7"
 base58 = "0.2.0"
 base64 = "0.22.1"
-borsh = "1.5.1"
+borsh = "0.10.3"
 bs58 = { version = "0.4", features = ["alloc"] }
 bytemuck = "1.16.1"
 futures = "0.3.30"
