@@ -14,6 +14,7 @@ pub use recent_slothashes::*;
 pub mod accounts;
 pub use accounts::*;
 pub mod lut_owner;
+pub mod address_lookup_table;
 use crate::oracle_job::OracleJob;
 use anyhow_ext::Error as AnyhowError;
 use lazy_static::lazy_static;

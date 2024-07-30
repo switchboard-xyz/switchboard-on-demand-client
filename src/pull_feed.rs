@@ -1,3 +1,4 @@
+use solana_sdk::address_lookup_table_account::AddressLookupTableAccount;
 use crate::Gateway;
 use crate::OracleAccountData;
 use crate::State;
@@ -15,7 +16,7 @@ use futures::future::try_join_all;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::address_lookup_table::AddressLookupTableAccount;
+// use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
