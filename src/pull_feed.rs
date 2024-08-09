@@ -164,14 +164,10 @@ impl PullFeed {
         let jobs: Vec<OracleJob> =
             serde_json::from_value(jobs.get("jobs").unwrap().clone()).unwrap();
         let encoded_jobs = encode_jobs(jobs);
-        // ""https://xoracle-1-mn.switchboard.xyz""
         let gateway = params.gateway;
 
-        // println!("max_variance: {:?}", data.max_variance);
-        // println!("max_variance: {:?}", data.max_variance / 1_000_000_000);
-        // println!("max_variance: {:?}", data.max_variance as u32);
         let num_signatures = if params.num_signatures.is_none() {
-            feed_data.min_responses + ((feed_data.min_responses as f64) / 3.0).ceil() as u32
+            (feed_data.min_sample_size as f64 + ((feed_data.min_sample_size as f64) / 3.0).ceil()) as u32
         } else {
             params.num_signatures.unwrap()
         };
@@ -272,12 +268,16 @@ impl PullFeed {
     ) -> Result<(Instruction, Vec<AddressLookupTableAccount>), AnyhowError> {
         let crossbar = params.crossbar.unwrap_or_default();
         let gateway = params.gateway;
-        let num_signatures = params.num_signatures.unwrap_or(1);
+        let mut num_signatures = params.num_signatures.unwrap_or(1);
         let mut feed_configs = Vec::new();
         let mut queue = Pubkey::default();
 
         for feed in &params.feeds {
             let data = PullFeed::load_data(client, &feed).await?;
+            let num_sig_lower_bound = data.min_sample_size as u32 + ((data.min_sample_size as f64) / 3.0).ceil() as u32;
+            if num_signatures < num_sig_lower_bound {
+                num_signatures = num_sig_lower_bound;
+            }
             queue = data.queue;
             let jobs = crossbar
                 .fetch(&hex::encode(data.feed_hash))
