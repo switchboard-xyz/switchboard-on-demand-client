@@ -4,9 +4,9 @@ use anyhow_ext::anyhow;
 use anyhow_ext::Error as AnyhowError;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::account::Account;
-use solana_sdk::address_lookup_table::instruction::derive_lookup_table_address;
-use solana_sdk::address_lookup_table::state::AddressLookupTable;
-use solana_sdk::address_lookup_table::AddressLookupTableAccount;
+use crate::address_lookup_table::derive_lookup_table_address;
+use crate::address_lookup_table::AddressLookupTable;
+use solana_sdk::address_lookup_table_account::AddressLookupTableAccount;
 use solana_sdk::pubkey::Pubkey;
 
 pub fn find_lut_signer(k: &Pubkey) -> Pubkey {
