@@ -1,5 +1,5 @@
+use crate::SWITCHBOARD_ON_DEMAND_PROGRAM_ID;
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
 
 const STATE_SEED: &[u8] = b"STATE";
 
@@ -46,7 +46,8 @@ impl State {
     pub fn key() -> Pubkey {
         Pubkey::find_program_address(&[STATE_SEED], &Self::pid()).0
     }
+
     pub fn pid() -> Pubkey {
-        Pubkey::from_str("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv").unwrap()
+        *SWITCHBOARD_ON_DEMAND_PROGRAM_ID
     }
 }

@@ -13,6 +13,10 @@ pub mod recent_slothashes;
 pub use recent_slothashes::*;
 pub mod accounts;
 pub use accounts::*;
+#[cfg(feature = "solana_sdk_1_16")]
+pub mod lut;
+#[cfg(feature = "solana_sdk_1_16")]
+pub use lut::*;
 pub mod lut_owner;
 use crate::oracle_job::OracleJob;
 use anyhow_ext::Error as AnyhowError;
@@ -28,8 +32,16 @@ use solana_sdk::transaction::Transaction;
 use std::str::FromStr;
 
 lazy_static! {
-    pub static ref SWITCHBOARD_ON_DEMAND_PROGRAM_ID: Pubkey =
+    pub static ref ON_DEMAND_MAINNET_PID: Pubkey =
         Pubkey::from_str("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv").unwrap();
+    pub static ref ON_DEMAND_DEVNET_PID: Pubkey =
+        Pubkey::from_str("Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2").unwrap();
+    pub static ref SWITCHBOARD_ON_DEMAND_PROGRAM_ID: Pubkey =
+        if cfg!(feature = "devnet") {
+            *ON_DEMAND_DEVNET_PID
+        } else {
+            *ON_DEMAND_MAINNET_PID
+        };
 }
 
 pub const STATE_SEED: &[u8] = b"STATE";

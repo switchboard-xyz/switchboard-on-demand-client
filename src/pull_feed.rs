@@ -2,8 +2,11 @@ use crate::Gateway;
 use crate::OracleAccountData;
 use crate::State;
 use crate::*;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 use anyhow_ext::anyhow;
 use anyhow_ext::Context;
+use dashmap::DashMap;
 use anyhow_ext::Error as AnyhowError;
 use associated_token_account::get_associated_token_address;
 use associated_token_account::NATIVE_MINT;
@@ -12,10 +15,10 @@ use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use bs58;
 use bytemuck;
 use futures::future::try_join_all;
+use tokio::join;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -23,10 +26,60 @@ use solana_sdk::system_program;
 use std::future::Future;
 use std::pin::Pin;
 use std::result::Result;
+#[cfg(feature = "solana_sdk_1_16")]
+use solana_sdk::address_lookup_table_account::AddressLookupTableAccount;
+#[cfg(not(feature = "solana_sdk_1_16"))]
+use solana_sdk::address_lookup_table::AddressLookupTableAccount;
+
+type LutCache = DashMap<Pubkey, AddressLookupTableAccount>;
+type JobCache = DashMap<[u8; 32], OnceCell<Vec<OracleJob>>>;
+type PullFeedCache = DashMap<Pubkey, OnceCell<PullFeedAccountData>>;
+
+pub struct SbContext {
+    pub lut_cache: LutCache,
+    pub job_cache: JobCache,
+    pub pull_feed_cache: PullFeedCache,
+}
+impl SbContext {
+    pub fn new() -> Arc<Self> {
+        Arc::new(SbContext {
+            lut_cache: DashMap::new(),
+            job_cache: DashMap::new(),
+            pull_feed_cache: DashMap::new(),
+        })
+    }
+}
+
+async fn fetch_and_cache_luts<T: bytemuck::Pod + lut_owner::LutOwner>(
+    client: &RpcClient,
+    context: Arc<SbContext>,
+    oracle_keys: &[Pubkey],
+) -> Result<Vec<AddressLookupTableAccount>, AnyhowError> {
+    let mut luts = Vec::new();
+    let mut keys_to_fetch = Vec::new();
+
+    for &key in oracle_keys {
+        if let Some(cached_lut) = context.lut_cache.get(&key) {
+            luts.push(cached_lut.clone());
+        } else {
+            keys_to_fetch.push(key);
+        }
+    }
+
+    if !keys_to_fetch.is_empty() {
+        let fetched_luts = load_lookup_tables::<T>(client, &keys_to_fetch).await?;
+        for (key, lut) in keys_to_fetch.into_iter().zip(fetched_luts.into_iter()) {
+            context.lut_cache.insert(key, lut.clone());
+            luts.push(lut);
+        }
+    }
+
+    Ok(luts)
+}
 
 #[derive(Clone, Debug)]
 pub struct OracleResponse {
-    pub value: Decimal,
+    pub value: Option<Decimal>,
     pub error: String,
     pub oracle: Pubkey,
     pub signature: [u8; 64],
@@ -52,18 +105,17 @@ pub struct FetchUpdateManyParams {
     pub num_signatures: Option<u32>,
     pub debug: Option<bool>,
 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct SolanaSubmitSignaturesParams {
+pub struct SolanaSubmitSignaturesParams {
     pub queue: Pubkey,
     pub feed: Pubkey,
     pub payer: Pubkey,
 }
 
 pub struct PullFeed;
+
 impl PullFeed {
-    /// Load the data from the PullFeed account
-    /// * `client` - The RPC client
-    /// * `key` - The account public key
     pub async fn load_data(
         client: &RpcClient,
         key: &Pubkey,
@@ -78,24 +130,20 @@ impl PullFeed {
         Ok(data.clone())
     }
 
-    /// Translate the Switchboard On-Demand oracle responses to a Solana instruction
-    /// * `slot` - The slot of the responses
-    /// * `responses` - The oracle responses
-    /// * `params` - The parameters for the instruction
-    /// * `params.feed` - The feed account
-    /// * `params.queue` - The queue account
-    /// * `params.payer` - The payer account
-    fn get_solana_submit_signatures_ix(
+    pub fn get_solana_submit_signatures_ix(
         slot: u64,
         responses: Vec<OracleResponse>,
         params: SolanaSubmitSignaturesParams,
     ) -> Result<Instruction, AnyhowError> {
         let mut submissions = Vec::new();
         for resp in &responses {
-            let mut value = resp.value;
-            value.rescale(18);
+            let mut value_i128 = i128::MAX;
+            if let Some(mut val) = resp.value {
+                val.rescale(18);
+                value_i128 = val.mantissa();
+            }
             submissions.push(Submission {
-                value: value.mantissa(),
+                value: value_i128,
                 signature: resp.signature,
                 recovery_id: resp.recovery_id,
                 offset: 0,
@@ -129,17 +177,8 @@ impl PullFeed {
         Ok(submit_ix)
     }
 
-    /// Fetch the oracle responses and format them into a Solana instruction.
-    /// Also fetches relevant lookup tables for the instruction.
-    /// * `client` - The RPC client
-    /// * `params` - The parameters for the fetch
-    /// * `params.feed` - The feed account
-    /// * `params.payer` - The payer account
-    /// * `params.gateway` - The gateway object
-    /// * `params.num_signatures` - The number of signatures to fetch
-    /// * `params.debug` - Whether to print debug information
-    /// Returns the Solana instruction, the oracle responses, the number of successful responses, and the lookup tables
     pub async fn fetch_update_ix(
+        context: Arc<SbContext>,
         client: &RpcClient,
         params: FetchUpdateParams,
     ) -> Result<
@@ -150,19 +189,42 @@ impl PullFeed {
             Vec<AddressLookupTableAccount>,
         ),
         AnyhowError,
-    > {
+        > {
         let latest_slot = SlotHashSysvar::get_latest_slothash(&client)
             .await
             .context("PullFeed.fetchUpdateIx: Failed to fetch latest slot")?;
 
-        let feed_data = PullFeed::load_data(client, &params.feed).await?;
-        let crossbar = params.crossbar.unwrap_or_default();
-        let jobs = crossbar
-            .fetch(&hex::encode(feed_data.feed_hash))
-            .await
-            .context("PullFeed.fetchUpdateIx: Failed to fetch jobs")?;
-        let jobs: Vec<OracleJob> =
-            serde_json::from_value(jobs.get("jobs").unwrap().clone()).unwrap();
+        let feed_data = context
+            .pull_feed_cache
+            .entry(params.feed)
+            .or_insert_with(OnceCell::new)
+            .get_or_try_init(||{
+                PullFeed::load_data(&client, &params.feed)
+            })
+            .await?
+            .clone();
+
+        let feed_hash = feed_data.feed_hash;
+        let jobs = context
+            .job_cache
+            .entry(feed_hash)
+            .or_insert_with(OnceCell::new)
+            .get_or_try_init(|| {
+                let crossbar = params.crossbar.clone().unwrap_or_default();
+                async move {
+                    let jobs_data = crossbar
+                        .fetch(&hex::encode(feed_hash))
+                        .await
+                        .context("PullFeed.fetchUpdateIx: Failed to fetch jobs")?;
+
+                    let jobs: Vec<OracleJob> = serde_json::from_value(jobs_data.get("jobs").unwrap().clone())
+                        .context("PullFeed.fetchUpdateIx: Failed to deserialize jobs")?;
+
+                    Ok::<Vec<OracleJob>, AnyhowError>(jobs)
+                }
+            })
+        .await?.clone();
+
         let encoded_jobs = encode_jobs(jobs);
         let gateway = params.gateway;
 
@@ -171,6 +233,7 @@ impl PullFeed {
         } else {
             params.num_signatures.unwrap()
         };
+
         let price_signatures = gateway
             .fetch_signatures_from_encoded(FetchSignaturesParams {
                 recent_hash: Some(bs58::encode(latest_slot.hash.clone()).into_string()),
@@ -188,29 +251,30 @@ impl PullFeed {
             .responses
             .iter()
             .map(|x| {
-                let value = x.success_value.parse::<i128>();
-                if value.is_ok() {
+                let value = x.success_value.parse::<i128>().ok();
+                let mut formatted_value = None;
+                if let Some(val) = value {
                     num_successes += 1;
+                    formatted_value = Some(Decimal::from_i128_with_scale(val, 18));
                 }
-                let value = Decimal::from_i128_with_scale(value.unwrap(), 18);
                 OracleResponse {
-                    value,
+                    value: formatted_value,
                     error: x.failure_error.clone(),
                     oracle: Pubkey::new_from_array(
                         hex::decode(x.oracle_pubkey.clone())
-                            .unwrap()
-                            .try_into()
-                            .unwrap(),
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
                     ),
                     recovery_id: x.recovery_id as u8,
                     signature: base64
                         .decode(x.signature.clone())
-                        .unwrap()
+                        .unwrap_or(Vec::new())
                         .try_into()
-                        .unwrap(),
+                        .unwrap_or([0; 64]),
                 }
             })
-            .collect();
+        .collect();
 
         if params.debug.unwrap_or(false) {
             println!("priceSignatures: {:?}", price_signatures);
@@ -218,13 +282,10 @@ impl PullFeed {
 
         if num_successes == 0 {
             return Err(anyhow_ext::Error::msg(format!(
-                "PullFeed.fetchUpdateIx Failure: {:?}",
-                oracle_responses
-                    .iter()
-                    .map(|x| &x.error)
-                    .collect::<Vec<&String>>()
+                "PullFeed.fetchUpdateIx Failure: No successful responses"
             )));
         }
+
         let submit_signatures_ix = PullFeed::get_solana_submit_signatures_ix(
             latest_slot.slot,
             oracle_responses.clone(),
@@ -234,24 +295,24 @@ impl PullFeed {
                 payer: params.payer,
             },
         )
-        .context("PullFeed.fetchUpdateIx: Failed to create submit signatures instruction")?;
+            .context("PullFeed.fetchUpdateIx: Failed to create submit signatures instruction")?;
 
         let oracle_keys: Vec<Pubkey> = oracle_responses.iter().map(|x| x.oracle).collect();
-        let feed_key = params.feed;
-        let feed = feed_data.clone();
-        let queue_key = feed.queue;
-        let mut luts: Vec<
-            Pin<Box<dyn Future<Output = Result<AddressLookupTableAccount, AnyhowError>> + Send>>,
-        > = Vec::new();
-        let oracle_luts = load_lookup_tables::<OracleAccountData>(client, &oracle_keys);
-        luts.push(Box::pin(load_lookup_table::<PullFeedAccountData>(
-            client, feed_key,
-        )));
-        luts.push(Box::pin(load_lookup_table::<QueueAccountData>(
-            client, queue_key,
-        )));
-        let mut luts = try_join_all(luts).await?;
-        luts.extend(oracle_luts.await?);
+        let feed_key = [params.feed];
+        let queue_key = [feed_data.queue];
+
+        let (oracle_luts, pull_feed_lut, queue_lut) = join!(
+            fetch_and_cache_luts::<OracleAccountData>(client, context.clone(), &oracle_keys),
+            fetch_and_cache_luts::<PullFeedAccountData>(client, context.clone(), &feed_key),
+            fetch_and_cache_luts::<QueueAccountData>(client, context.clone(), &queue_key)
+        );
+        let oracle_luts = oracle_luts?;
+        let pull_feed_lut = pull_feed_lut?;
+        let queue_lut = queue_lut?;
+
+        let mut luts = oracle_luts;
+        luts.extend(pull_feed_lut);
+        luts.extend(queue_lut);
 
         Ok((submit_signatures_ix, oracle_responses, num_successes, luts))
     }
@@ -263,28 +324,48 @@ impl PullFeed {
     /// * `client` - The RPC client
     /// * `params` - The parameters for the fetch
     pub async fn fetch_update_many_ix(
+        context: Arc<SbContext>,
         client: &RpcClient,
         params: FetchUpdateManyParams,
     ) -> Result<(Instruction, Vec<AddressLookupTableAccount>), AnyhowError> {
-        let crossbar = params.crossbar.unwrap_or_default();
+        let crossbar = params.crossbar.clone().unwrap_or_default();
         let gateway = params.gateway;
         let mut num_signatures = params.num_signatures.unwrap_or(1);
         let mut feed_configs = Vec::new();
         let mut queue = Pubkey::default();
 
         for feed in &params.feeds {
-            let data = PullFeed::load_data(client, &feed).await?;
+            let data = context
+                .pull_feed_cache
+                .entry(*feed)
+                .or_insert_with(OnceCell::new)
+                .get_or_try_init(|| PullFeed::load_data(client, &feed))
+                .await?
+                .clone();
             let num_sig_lower_bound = data.min_sample_size as u32 + ((data.min_sample_size as f64) / 3.0).ceil() as u32;
             if num_signatures < num_sig_lower_bound {
                 num_signatures = num_sig_lower_bound;
             }
             queue = data.queue;
-            let jobs = crossbar
-                .fetch(&hex::encode(data.feed_hash))
-                .await
-                .context("PullFeed.fetchUpdateIx: Failed to fetch jobs")?;
-            let jobs: Vec<OracleJob> =
-                serde_json::from_value(jobs.get("jobs").unwrap().clone()).unwrap();
+            let jobs = context
+                .job_cache
+                .entry(data.feed_hash)
+                .or_insert_with(OnceCell::new)
+                .get_or_try_init(|| {
+                    let crossbar = params.crossbar.clone().unwrap_or_default();
+                    async move {
+                        let jobs_data = crossbar
+                            .fetch(&hex::encode(data.feed_hash))
+                            .await
+                            .context("PullFeed.fetchUpdateIx: Failed to fetch jobs")?;
+
+                        let jobs: Vec<OracleJob> = serde_json::from_value(jobs_data.get("jobs").unwrap().clone())
+                            .context("PullFeed.fetchUpdateIx: Failed to deserialize jobs")?;
+
+                        Ok::<Vec<OracleJob>, AnyhowError>(jobs)
+                    }
+                })
+            .await?.clone();
             let encoded_jobs = encode_jobs(jobs);
             let max_variance = (data.max_variance / 1_000_000_000) as u32;
             let min_responses = data.min_responses;
@@ -319,12 +400,12 @@ impl PullFeed {
                     .iter()
                     .map(|x| x.success_value.parse().unwrap_or(i128::MAX))
                     .collect(),
-                signature: base64
-                    .decode(x.signature.clone())
-                    .context("base64:decode failure")?
-                    .try_into()
-                    .map_err(|_| anyhow!("base64:decode failure"))?,
-                recovery_id: x.recovery_id as u8,
+                    signature: base64
+                        .decode(x.signature.clone())
+                        .context("base64:decode failure")?
+                        .try_into()
+                        .map_err(|_| anyhow!("base64:decode failure"))?,
+                        recovery_id: x.recovery_id as u8,
             });
         }
         let ix_data = PullFeedSubmitResponseManyParams {
@@ -338,12 +419,12 @@ impl PullFeed {
             .map(|x| {
                 Pubkey::new_from_array(
                     hex::decode(x.feed_responses.get(0).unwrap().oracle_pubkey.clone())
-                        .unwrap_or_default()
-                        .try_into()
-                        .unwrap(),
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap(),
                 )
             })
-            .collect();
+        .collect();
         for feed in &params.feeds {
             remaining_accounts.push(AccountMeta::new(*feed, false));
         }
@@ -353,17 +434,22 @@ impl PullFeed {
             remaining_accounts.push(AccountMeta::new(stats_key, false));
         }
 
-        let mut luts: Vec<
-            Pin<Box<dyn Future<Output = Result<AddressLookupTableAccount, AnyhowError>> + Send>>,
-        > = Vec::new();
-        let oracle_luts = load_lookup_tables::<OracleAccountData>(client, &oracle_keys);
-        let feed_luts = load_lookup_tables::<PullFeedAccountData>(client, &params.feeds);
-        luts.push(Box::pin(load_lookup_table::<QueueAccountData>(
-            client, queue,
-        )));
-        let mut luts = try_join_all(luts).await?;
-        luts.extend(oracle_luts.await?);
-        luts.extend(feed_luts.await?);
+
+        let queue_key = [queue];
+        let (oracle_luts_result, pull_feed_luts_result, queue_lut_result) = join!(
+            fetch_and_cache_luts::<OracleAccountData>(client, context.clone(), &oracle_keys),
+            fetch_and_cache_luts::<PullFeedAccountData>(client, context.clone(), &params.feeds),
+            fetch_and_cache_luts::<QueueAccountData>(client, context.clone(), &queue_key)
+        );
+
+        // Handle the results after they are all awaited
+        let oracle_luts = oracle_luts_result?;
+        let pull_feed_luts = pull_feed_luts_result?;
+        let queue_lut = queue_lut_result?;
+
+        let mut luts = oracle_luts;
+        luts.extend(pull_feed_luts);
+        luts.extend(queue_lut);
 
         let mut submit_ix = Instruction {
             program_id: *SWITCHBOARD_ON_DEMAND_PROGRAM_ID,
